@@ -1,0 +1,380 @@
+name: Deploy service
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: 40-character lowercase commit to deploy. The caller resolves it.
+        required: true
+        type: string
+      explicit_ref:
+        description: Allow a SHA that is not a descendant of the production checkout.
+        required: false
+        type: boolean
+        default: false
+      production_checkout:
+        description: Absolute path of the git checkout on the runner.
+        required: true
+        type: string
+      deploy_command:
+        description: Command run in the production checkout after install.
+        required: true
+        type: string
+      install_command:
+        description: Install command run before deploy and before publish.
+        required: false
+        type: string
+        default: "bun install --frozen-lockfile"
+      health_urls:
+        description: Space-separated URLs. Each body must include "status":"ok" and "revision":"<sha>".
+        required: true
+        type: string
+      health_timeout_seconds:
+        description: Seconds to poll health URLs before failing.
+        required: false
+        type: number
+        default: 180
+      runner:
+        description: runs-on value for deploy, the version backstop, and publish when provenance is off.
+        required: false
+        type: string
+        default: self-hosted
+      published_packages:
+        description: dir:name,dir:name in publish order. Empty skips publish and the version backstop.
+        required: false
+        type: string
+        default: ""
+      publish_provenance:
+        description: true publishes on ubuntu-latest with provenance. false publishes on runner without provenance.
+        required: false
+        type: boolean
+        default: true
+      bun_version:
+        description: Bun version for the publish job. Required when a package is missing on npm.
+        required: false
+        type: string
+        default: ""
+      prepublish_command:
+        description: Shell command after install and before the npm token is resolved.
+        required: false
+        type: string
+        default: ""
+      release_token_env_name:
+        description: Env var that receives GH_RELEASE_AGENT_TOOLING_OP_TOKEN. Required to publish.
+        required: false
+        type: string
+        default: ""
+      release_switch_env_name:
+        description: Env var set to true so varlock resolves release tokens. Required to publish.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GH_DEPLOY_AGENT_PRODUCTION_OP_TOKEN:
+        description: 1Password token for the production deploy agent.
+        required: true
+      GH_RELEASE_AGENT_TOOLING_OP_TOKEN:
+        description: 1Password token for the release agent. Required when publishing.
+        required: false
+
+permissions:
+  contents: write
+  id-token: write
+  packages: read
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      deployed: ${{ steps.sync.outputs.deployed }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - name: Sync the deployment checkout
+        id: sync
+        working-directory: ${{ inputs.production_checkout }}
+        env:
+          TARGET_SHA: ${{ inputs.sha }}
+          EXPLICIT_REF: ${{ inputs.explicit_ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TARGET_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Target must be a 40-character lowercase SHA." >&2
+            exit 1
+          fi
+          git fetch origin "$TARGET_SHA"
+          if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --unshallow origin; fi
+          if [ "$EXPLICIT_REF" != true ] && ! git merge-base --is-ancestor HEAD "$TARGET_SHA"; then
+            echo "Skipping $TARGET_SHA. It is not a descendant of production $(git rev-parse HEAD)."
+            printf 'decision=skip\ndeployed=false\nsha=%s\n' "$TARGET_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git merge-base --is-ancestor HEAD "$TARGET_SHA"; then
+            git merge --ff-only "$TARGET_SHA"
+          else
+            git reset --keep "$TARGET_SHA"
+          fi
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          printf 'decision=deploy\ndeployed=true\nsha=%s\n' "$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        if: steps.sync.outputs.decision != 'skip'
+        working-directory: ${{ inputs.production_checkout }}
+        timeout-minutes: 5
+        env:
+          MERCHBASE_GITHUB_NPM_TOKEN: ${{ github.token }}
+          INSTALL_COMMAND: ${{ inputs.install_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$INSTALL_COMMAND"
+
+      - name: Deploy
+        if: steps.sync.outputs.decision != 'skip'
+        working-directory: ${{ inputs.production_checkout }}
+        env:
+          DEPLOY_AGENT_PRODUCTION_OP_TOKEN: ${{ secrets.GH_DEPLOY_AGENT_PRODUCTION_OP_TOKEN }}
+          MERCHBASE_GITHUB_NPM_TOKEN: ${{ github.token }}
+          DEPLOY_COMMAND: ${{ inputs.deploy_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$DEPLOY_COMMAND"
+
+      - name: Verify health
+        if: steps.sync.outputs.decision != 'skip'
+        env:
+          HEALTH_URLS: ${{ inputs.health_urls }}
+          HEALTH_TIMEOUT_SECONDS: ${{ inputs.health_timeout_seconds }}
+          HEALTH_REVISION: ${{ steps.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+          read -ra urls <<< "$HEALTH_URLS"
+          if [ "${#urls[@]}" -eq 0 ]; then
+            echo "health_urls is empty." >&2
+            exit 1
+          fi
+          while true; do
+            ok=true
+            for url in "${urls[@]}"; do
+              body=$(curl --silent --show-error --max-time 20 "$url" || true)
+              printf '%s' "$body" | grep -q '"status":"ok"' || ok=false
+              printf '%s' "$body" | grep -Fq "\"revision\":\"${HEALTH_REVISION}\"" || ok=false
+            done
+            if [ "$ok" = true ]; then
+              echo "Health converged on ${HEALTH_REVISION}."
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Health did not converge on ${HEALTH_REVISION}." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+  publish:
+    name: Publish packages
+    needs: deploy
+    if: needs.deploy.result == 'success' && needs.deploy.outputs.deployed == 'true' && inputs.published_packages != ''
+    runs-on: ${{ inputs.publish_provenance && 'ubuntu-latest' || inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      packages: read
+    steps:
+      - name: Check out the deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.deploy.outputs.sha }}
+          fetch-depth: 0
+
+      - name: See which packages are missing on npm
+        id: pending
+        env:
+          TARGET_SHA: ${{ needs.deploy.outputs.sha }}
+          PUBLISHED_PACKAGES: ${{ inputs.published_packages }}
+          BUN_VERSION: ${{ inputs.bun_version }}
+          RELEASE_TOKEN_ENV_NAME: ${{ inputs.release_token_env_name }}
+          RELEASE_SWITCH_ENV_NAME: ${{ inputs.release_switch_env_name }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          pending_dirs=()
+          version=""
+          IFS=',' read -ra entries <<< "$PUBLISHED_PACKAGES"
+          for entry in "${entries[@]}"; do
+            case "$entry" in
+              *:*) ;;
+              *)
+                echo "published_packages entries must be dir:name, got ${entry}." >&2
+                exit 1
+                ;;
+            esac
+            dir="${entry%%:*}"
+            name="${entry#*:}"
+            if [ -z "$dir" ] || [ -z "$name" ]; then
+              echo "published_packages entries must be dir:name, got ${entry}." >&2
+              exit 1
+            fi
+            ver=$(node -p "require('./${dir}/package.json').version")
+            version="$ver"
+            seen=$(npm view "${name}@${ver}" version 2>/dev/null || true)
+            if [ -z "$seen" ]; then
+              pending_dirs+=("$dir")
+            fi
+          done
+          if [ "${#pending_dirs[@]}" -eq 0 ]; then
+            echo "npm already has v${version}."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BUN_VERSION" ] || [ -z "$RELEASE_TOKEN_ENV_NAME" ] || [ -z "$RELEASE_SWITCH_ENV_NAME" ]; then
+            echo "bun_version, release_token_env_name, and release_switch_env_name are required to publish." >&2
+            exit 1
+          fi
+          {
+            echo "publish=true"
+            echo "version=${version}"
+            echo "dirs=${pending_dirs[*]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Bun
+        if: steps.pending.outputs.publish == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      - name: Install dependencies
+        if: steps.pending.outputs.publish == 'true'
+        timeout-minutes: 5
+        env:
+          MERCHBASE_GITHUB_NPM_TOKEN: ${{ github.token }}
+          INSTALL_COMMAND: ${{ inputs.install_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$INSTALL_COMMAND"
+
+      - name: Publish packages that are not on npm
+        if: steps.pending.outputs.publish == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.pending.outputs.version }}
+          PENDING_DIRS: ${{ steps.pending.outputs.dirs }}
+          PUBLISH_PROVENANCE: ${{ inputs.publish_provenance }}
+          PREPUBLISH_COMMAND: ${{ inputs.prepublish_command }}
+          RELEASE_TOKEN_ENV_NAME: ${{ inputs.release_token_env_name }}
+          RELEASE_SWITCH_ENV_NAME: ${{ inputs.release_switch_env_name }}
+          RELEASE_TOKEN_VALUE: ${{ secrets.GH_RELEASE_AGENT_TOOLING_OP_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TOKEN_ENV_NAME" in
+            [A-Za-z_][A-Za-z0-9_]*) ;;
+            *)
+              echo "release_token_env_name must be an environment variable name." >&2
+              exit 1
+              ;;
+          esac
+          case "$RELEASE_SWITCH_ENV_NAME" in
+            [A-Za-z_][A-Za-z0-9_]*) ;;
+            *)
+              echo "release_switch_env_name must be an environment variable name." >&2
+              exit 1
+              ;;
+          esac
+          test -n "$RELEASE_TOKEN_VALUE"
+          printf -v "$RELEASE_TOKEN_ENV_NAME" '%s' "$RELEASE_TOKEN_VALUE"
+          export "${RELEASE_TOKEN_ENV_NAME?}"
+          printf -v "$RELEASE_SWITCH_ENV_NAME" '%s' 'true'
+          export "${RELEASE_SWITCH_ENV_NAME?}"
+          unset RELEASE_TOKEN_VALUE
+
+          root="$PWD"
+          if [ -n "$PREPUBLISH_COMMAND" ]; then
+            bash --noprofile --norc -euo pipefail -c "$PREPUBLISH_COMMAND"
+          fi
+
+          cd "$root"
+          MERCHBASE_NPM_PUBLISH_TOKEN="$(bunx varlock printenv MERCHBASE_NPM_PUBLISH_TOKEN)"
+          echo "::add-mask::$MERCHBASE_NPM_PUBLISH_TOKEN"
+          test -n "$MERCHBASE_NPM_PUBLISH_TOKEN"
+          export MERCHBASE_NPM_PUBLISH_TOKEN
+
+          if [ "$PUBLISH_PROVENANCE" = true ]; then
+            provenance_flag=--provenance
+          else
+            provenance_flag=--provenance=false
+          fi
+          read -ra dirs <<< "$PENDING_DIRS"
+          last=$((${#dirs[@]} - 1))
+          for i in "${!dirs[@]}"; do
+            dir="${dirs[$i]}"
+            name=$(node -p "require('./${dir}/package.json').name")
+            ver=$(node -p "require('./${dir}/package.json').version")
+            (cd "$dir" && npm publish --access public "$provenance_flag" --userconfig "$root/.npmrc")
+            if [ "$i" -eq "$last" ]; then
+              continue
+            fi
+            deadline=$((SECONDS + 180))
+            until npm view "${name}@${ver}" version >/dev/null 2>&1; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "npm did not show ${name}@${ver} within 3 minutes." >&2
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+          tag="v${PACKAGE_VERSION}"
+          if git ls-remote --exit-code origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            exit 0
+          fi
+          git tag -d "$tag" >/dev/null 2>&1 || true
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$tag" -m "$tag" HEAD
+          git -c "http.extraheader=AUTHORIZATION: bearer ${GITHUB_TOKEN}" push "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${tag}"
+
+  version-backstop:
+    name: Version bump backstop
+    needs: [deploy, publish]
+    if: always() && needs.deploy.result == 'success' && needs.deploy.outputs.deployed == 'true' && needs.publish.result != 'cancelled' && inputs.published_packages != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fail when a published package changed without a bump
+        working-directory: ${{ inputs.production_checkout }}
+        env:
+          PUBLISHED_PACKAGES: ${{ inputs.published_packages }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra entries <<< "$PUBLISHED_PACKAGES"
+          for entry in "${entries[@]}"; do
+            case "$entry" in
+              *:*) ;;
+              *)
+                echo "published_packages entries must be dir:name, got ${entry}." >&2
+                exit 1
+                ;;
+            esac
+            dir="${entry%%:*}"
+            name="${entry#*:}"
+            if [ -z "$dir" ] || [ -z "$name" ]; then
+              echo "published_packages entries must be dir:name, got ${entry}." >&2
+              exit 1
+            fi
+            ver=$(node -p "require('./${dir}/package.json').version")
+            published=$(npm view "$name" version 2>/dev/null || true)
+            if [ "$ver" != "$published" ]; then
+              continue
+            fi
+            if git fetch origin "refs/tags/v${ver}:refs/tags/v${ver}"; then
+              changed=$(git diff --name-only "v${ver}" HEAD -- "$dir")
+              if [ -n "$changed" ]; then
+                echo "${name}@${ver} changed since v${ver} without a version bump." >&2
+                exit 1
+              fi
+            else
+              echo "No origin tag v${ver} for ${name}. Skipping."
+              continue
+            fi
+          done
+          echo "Version bump backstop passed."
