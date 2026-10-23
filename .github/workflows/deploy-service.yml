@@ -325,7 +325,25 @@ jobs:
             dir="${dirs[$i]}"
             name=$(node -p "require('./${dir}/package.json').name")
             ver=$(node -p "require('./${dir}/package.json').version")
-            (cd "$dir" && npm publish --access public "$provenance_flag" --userconfig "$root/.npmrc")
+            publish_log=$(mktemp)
+            if (cd "$dir" && npm publish --access public "$provenance_flag" --userconfig "$root/.npmrc") >"$publish_log" 2>&1; then
+              cat "$publish_log"
+            else
+              already_published=false
+              if grep -q 'EPUBLISHCONFLICT' "$publish_log"; then
+                already_published=true
+              elif grep -q 'E403' "$publish_log" && grep -F -q 'cannot publish over' "$publish_log"; then
+                already_published=true
+              fi
+              if [ "$already_published" = true ]; then
+                echo "${name}@${ver} is already on npm. Continuing."
+              else
+                cat "$publish_log" >&2
+                rm -f "$publish_log"
+                exit 1
+              fi
+            fi
+            rm -f "$publish_log"
             if [ "$i" -eq "$last" ]; then
               continue
             fi
