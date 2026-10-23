@@ -6,7 +6,7 @@ Shared GitHub Actions for Merchbase services on the Mac mini.
 
 When `published_packages` is set, packages publish in that order. Each one must be visible on npm before the next publish. The workflow then pushes `v<version>` from the last entry and runs the version-bump backstop. An empty list skips both.
 
-Pass `secrets: inherit`. The caller grants `contents: write`, `id-token: write`, and `packages: read`. The deploy job maps `GH_DEPLOY_AGENT_PRODUCTION_OP_TOKEN` to `DEPLOY_AGENT_PRODUCTION_OP_TOKEN`. The publish job maps `GH_RELEASE_AGENT_TOOLING_OP_TOKEN` to `release_token_env_name`, sets `release_switch_env_name` to `true`, and reads `MERCHBASE_NPM_PUBLISH_TOKEN` with `bunx varlock printenv` at the repo root. The repo `.npmrc` must reference that token. Publish runs `npm publish --access public`.
+Pass `secrets: inherit`. The caller grants `contents: write`, `id-token: write`, and `packages: read`. The deploy job maps `GH_DEPLOY_AGENT_PRODUCTION_OP_TOKEN` to `DEPLOY_AGENT_PRODUCTION_OP_TOKEN`. The publish install step maps that same secret to `CI_OP_TOKEN`, so `publish_install_command` can resolve Development-vault install tokens (GitHub Packages, HugeIcons) the way Quality does. A custom command does not receive `github.token` as `MERCHBASE_GITHUB_NPM_TOKEN`. The release token stays on the npm publish step: `GH_RELEASE_AGENT_TOOLING_OP_TOKEN` is mapped to `release_token_env_name`, `release_switch_env_name` is set to `true`, and `MERCHBASE_NPM_PUBLISH_TOKEN` is read with `bunx varlock printenv` at the repo root. The repo `.npmrc` must reference that token. Publish runs `npm publish --access public`.
 
 ## Caller
 
@@ -66,7 +66,8 @@ jobs:
 | `explicit_ref` | `false` | Allow a SHA that is not a descendant of the checkout |
 | `production_checkout` | required | Absolute path of the git checkout on the runner |
 | `deploy_command` | required | Command run in that checkout after install |
-| `install_command` | `bun install --frozen-lockfile` | Install before deploy and before publish |
+| `install_command` | `bun install --frozen-lockfile` | Install before deploy. Also the publish install when `publish_install_command` is empty |
+| `publish_install_command` | `install_command` | Publish-job install. The step sets `CI_OP_TOKEN`. Example: `. ./scripts/install-tokens && bun install --frozen-lockfile` |
 | `health_urls` | required | Space-separated URLs. Each body must include `"status":"ok"` and `"revision":"<sha>"` |
 | `health_timeout_seconds` | `180` | Stop polling after this many seconds |
 | `runner` | `self-hosted` | `runs-on` for deploy, the backstop, and publish when provenance is off |

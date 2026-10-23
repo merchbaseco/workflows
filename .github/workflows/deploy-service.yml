@@ -21,10 +21,18 @@ on:
         required: true
         type: string
       install_command:
-        description: Install command run before deploy and before publish.
+        description: Install command run before deploy. The publish job uses it unless publish_install_command is set.
         required: false
         type: string
         default: "bun install --frozen-lockfile"
+      publish_install_command:
+        description: >-
+          Publish-job install command. Empty uses install_command. Set this to
+          resolve private @merchbaseco/* tokens through varlock; the step provides
+          CI_OP_TOKEN and does not export github.token as MERCHBASE_GITHUB_NPM_TOKEN.
+        required: false
+        type: string
+        default: ""
       health_urls:
         description: Space-separated URLs. Each body must include "status":"ok" and "revision":"<sha>".
         required: true
@@ -248,9 +256,17 @@ jobs:
         if: steps.pending.outputs.publish == 'true'
         timeout-minutes: 5
         env:
+          CI_OP_TOKEN: ${{ secrets.GH_DEPLOY_AGENT_PRODUCTION_OP_TOKEN }}
           MERCHBASE_GITHUB_NPM_TOKEN: ${{ github.token }}
+          PUBLISH_INSTALL_COMMAND: ${{ inputs.publish_install_command }}
           INSTALL_COMMAND: ${{ inputs.install_command }}
-        run: bash --noprofile --norc -eo pipefail -c "$INSTALL_COMMAND"
+        run: |
+          set -euo pipefail
+          if [ -n "$PUBLISH_INSTALL_COMMAND" ]; then
+            unset MERCHBASE_GITHUB_NPM_TOKEN
+            INSTALL_COMMAND="$PUBLISH_INSTALL_COMMAND"
+          fi
+          bash --noprofile --norc -eo pipefail -c "$INSTALL_COMMAND"
 
       - name: Publish packages that are not on npm
         if: steps.pending.outputs.publish == 'true'
