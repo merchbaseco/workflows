@@ -50,7 +50,9 @@ jobs:
       explicit_ref: ${{ needs.resolve.outputs.explicit_ref == 'true' }}
       production_checkout: /Users/me/srv/my-service
       deploy_command: bun run deploy
-      health_urls: https://my-service.example/health/live https://my-service.example/api/health
+      # Liveness only: /health/live or /api/live. Never strict /api/health.
+      # /api/health reports data freshness and can be degraded right after a deploy or downtime.
+      health_urls: https://my-service.example/health/live https://my-service.example/api/live
       published_packages: packages/client:@scope/client
       bun_version: "1.4.2"
       prepublish_command: bun run release:check && bun run build
@@ -68,7 +70,7 @@ jobs:
 | `deploy_command` | required | Command run in that checkout after install |
 | `install_command` | `bun install --frozen-lockfile` | Install before deploy. Also the publish install when `publish_install_command` is empty |
 | `publish_install_command` | `install_command` | Publish-job install. The step sets `CI_OP_TOKEN`. Example: `. ./scripts/install-tokens && bun install --frozen-lockfile` |
-| `health_urls` | required | Space-separated URLs. Each body must include `"status":"ok"` and `"revision":"<sha>"` |
+| `health_urls` | required | Space-separated liveness URLs (`/health/live` or `/api/live`). Each body must include `"status":"ok"` and `"revision":"<sha>"`. Never strict `/api/health`: it reports data freshness and can be degraded right after a deploy or downtime even though the deploy is fine |
 | `health_timeout_seconds` | `180` | Stop polling after this many seconds |
 | `runner` | `self-hosted` | `runs-on` for deploy, the backstop, and publish when provenance is off |
 | `published_packages` | empty | `dir:name,dir:name` in dependency order. Empty skips publish and the backstop |
