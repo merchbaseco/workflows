@@ -2,7 +2,7 @@
 
 Shared GitHub Actions for Merchbase services on the Mac mini.
 
-`deploy-service.yml` updates a checkout that already exists on the runner. A shallow repo is unshallowed once. A descendant SHA is fast-forwarded. Any other SHA is applied with `git reset --keep` when `explicit_ref` is true, and skipped otherwise. Health URLs must then return `"status":"ok"` and `"revision":"<sha>"`.
+`deploy-service.yml` updates a checkout that already exists on the runner. A shallow repo is unshallowed once. It then refreshes `origin/main` and refuses any SHA that is not an ancestor of `origin/main`, including when `explicit_ref` is true. A descendant SHA is fast-forwarded. Any other SHA is applied with `git reset --keep` when `explicit_ref` is true, and skipped otherwise. Health URLs must then return `"status":"ok"` and `"revision":"<sha>"`.
 
 When `published_packages` is set, packages publish in that order. Each one must be visible on npm before the next publish. The workflow then pushes `v<version>` from the last entry and runs the version-bump backstop. An empty list skips both.
 

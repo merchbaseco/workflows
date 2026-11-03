@@ -116,6 +116,14 @@ jobs:
           fi
           git fetch origin "$TARGET_SHA"
           if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --unshallow origin; fi
+          # workflow_run branches:[main] matches a PR head named main, including forks.
+          # Only SHAs already on origin/main may deploy (explicit_ref rollbacks included).
+          # Runs after unshallow so merge-base sees full history.
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$TARGET_SHA" origin/main; then
+            echo "Refusing $TARGET_SHA: it is not an ancestor of origin/main." >&2
+            exit 1
+          fi
           if [ "$EXPLICIT_REF" != true ] && ! git merge-base --is-ancestor HEAD "$TARGET_SHA"; then
             echo "Skipping $TARGET_SHA. It is not a descendant of production $(git rev-parse HEAD)."
             printf 'decision=skip\ndeployed=false\nsha=%s\n' "$TARGET_SHA" >> "$GITHUB_OUTPUT"
