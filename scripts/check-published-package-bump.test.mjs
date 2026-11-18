@@ -126,6 +126,11 @@ describe('resolveShippedScope', () => {
         assert.deepEqual(['src/a.ts', 'cli/main.ts'].filter(inScope), ['src/a.ts', 'cli/main.ts']);
     });
 
+    it('keeps rootDir when committed output sits under the outDir', () => {
+        const inScope = resolveShippedScope({ packFiles: ['dist/types.d.ts'], files: ['dist'], tsconfig });
+        assert.deepEqual(['src/a.ts', 'dist/types.d.ts', 'scripts/x.ts'].filter(inScope), ['src/a.ts', 'dist/types.d.ts']);
+    });
+
     it('uses source_dirs instead of the fallback', () => {
         const inScope = resolveShippedScope({ packFiles: [], files: ['dist'], tsconfig: null, sourceDirs: ['src'] });
         assert.deepEqual(['src/index.ts', 'scripts/build.ts'].filter(inScope), ['src/index.ts']);

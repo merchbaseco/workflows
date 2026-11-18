@@ -100,20 +100,19 @@ const coversOutDir = (entry, outDir) => {
 
 const prefixFor = dir => (dir === '.' ? '' : `${dir}/`);
 
-// npm pack only lists build output that exists, and CI has not built it. Each unbuilt
-// "files" entry maps to the source behind it: sourceDirs when the caller names them,
-// the tsconfig rootDir when its outDir covers the entry, else the whole package
-// minus tests and fixtures, so an unknown build fails closed.
+// npm pack only lists build output that exists, and CI has not built it. sourceDirs, when
+// the caller names them, are shipped source. Otherwise an entry the tsconfig outDir covers
+// ships rootDir even if some output is committed, and any other unbuilt entry ships the
+// whole package minus tests and fixtures, so an unknown build fails closed.
 export const resolveShippedScope = ({ packFiles, files = [], tsconfig, sourceDirs = [] }) => {
     const exact = new Set(['package.json', ...packFiles]);
     const prefixes = new Set();
     const outDir = stripDotSlash(tsconfig?.compilerOptions?.outDir ?? '');
-    for (const entry of files.map(stripDotSlash).filter(entry => isUnbuilt(entry, packFiles))) {
-        if (sourceDirs.length > 0) {
-            sourceDirs.forEach(sourceDir => prefixes.add(prefixFor(sourceDir)));
-        } else if (coversOutDir(entry, outDir)) {
+    sourceDirs.forEach(sourceDir => prefixes.add(prefixFor(sourceDir)));
+    for (const entry of sourceDirs.length > 0 ? [] : files.map(stripDotSlash)) {
+        if (coversOutDir(entry, outDir)) {
             prefixes.add(prefixFor(stripDotSlash(tsconfig.compilerOptions.rootDir ?? inferRootDir(tsconfig.include))));
-        } else {
+        } else if (isUnbuilt(entry, packFiles)) {
             prefixes.add('');
         }
     }
