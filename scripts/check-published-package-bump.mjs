@@ -53,7 +53,7 @@ export const resolveShippedScope = ({ packFiles, files = [], tsconfig }) => {
     const outDir = stripDotSlash(tsconfig?.compilerOptions?.outDir ?? '');
     const shipsOutDir = files.some(entry => {
         const shipped = stripDotSlash(entry);
-        return shipped === outDir || shipped.startsWith(`${outDir}/`);
+        return shipped === outDir || shipped.startsWith(`${outDir}/`) || /[*?[{!]/.test(shipped.split('/')[0]);
     });
     if (outDir && outDir !== '.' && shipsOutDir) {
         const rootDir = stripDotSlash(tsconfig.compilerOptions.rootDir ?? inferRootDir(tsconfig.include));

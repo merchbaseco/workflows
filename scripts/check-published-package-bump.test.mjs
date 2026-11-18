@@ -67,7 +67,7 @@ describe('resolveShippedScope', () => {
     });
 
     it('matches a files glob or file under the outDir', () => {
-        for (const files of [['dist/**'], ['./dist/index.js']]) {
+        for (const files of [['dist/**'], ['./dist/index.js'], ['**/*.js', '**/*.d.ts'], ['*.js']]) {
             assert.equal(resolveShippedScope({ packFiles: [], files, tsconfig })('src/index.ts'), true, files[0]);
         }
     });
