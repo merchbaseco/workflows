@@ -17,9 +17,10 @@ export const parsePublishedPackages = value =>
         .filter(Boolean)
         .map(entry => {
             const separator = entry.indexOf(':');
-            const dir = separator === -1 ? '' : path.posix.normalize(entry.slice(0, separator)).replace(/\/$/, '');
+            const rawDir = separator === -1 ? '' : entry.slice(0, separator);
+            const dir = rawDir && path.posix.normalize(rawDir).replace(/\/$/, '');
             const name = separator === -1 ? '' : entry.slice(separator + 1);
-            if (!dir || !name || dir === '.' || path.posix.isAbsolute(dir) || dir.split('/').includes('..')) {
+            if (!dir || !name || path.posix.isAbsolute(dir) || dir.split('/').includes('..')) {
                 throw new Error(`published_packages entries must be dir:name with a relative dir, got ${entry}.`);
             }
             return { dir, name };
@@ -34,7 +35,15 @@ export const resolveBaseRef = ({ baseRef, prBase, mergeGroupBase, pushBefore }) 
     return 'HEAD~1';
 };
 
-const stripDotSlash = entry => entry.replace(/^\.\//, '').replace(/\/+$/, '');
+const stripDotSlash = entry => path.posix.normalize(entry).replace(/^\.\//, '').replace(/\/+$/, '');
+
+// Without rootDir, tsc uses the common root of its inputs. A shared first include
+// segment ("src/**/*") stands in for it. Otherwise the whole package counts as source.
+const inferRootDir = include => {
+    const roots = new Set((include ?? []).map(entry => stripDotSlash(entry).split('/')[0]));
+    const [root] = roots;
+    return roots.size === 1 && root && !root.includes('*') ? root : '.';
+};
 
 // npm pack only lists build output that exists, and CI has not built it. When "files"
 // ships the tsconfig outDir, the rootDir that compiles into it is shipped source.
@@ -42,8 +51,12 @@ export const resolveShippedScope = ({ packFiles, files = [], tsconfig }) => {
     const exact = new Set(['package.json', ...packFiles]);
     const prefixes = [];
     const outDir = stripDotSlash(tsconfig?.compilerOptions?.outDir ?? '');
-    const rootDir = stripDotSlash(tsconfig?.compilerOptions?.rootDir ?? '');
-    if (outDir && rootDir && files.some(entry => stripDotSlash(entry) === outDir)) {
+    const shipsOutDir = files.some(entry => {
+        const shipped = stripDotSlash(entry);
+        return shipped === outDir || shipped.startsWith(`${outDir}/`);
+    });
+    if (outDir && outDir !== '.' && shipsOutDir) {
+        const rootDir = stripDotSlash(tsconfig.compilerOptions.rootDir ?? inferRootDir(tsconfig.include));
         prefixes.push(rootDir === '.' ? '' : `${rootDir}/`);
     }
     return file => exact.has(file) || prefixes.some(prefix => file.startsWith(prefix));
@@ -51,21 +64,27 @@ export const resolveShippedScope = ({ packFiles, files = [], tsconfig }) => {
 
 export const checkPackageBump = async ({ dir, name }, deps) => {
     const head = await deps.readPackage('head', dir);
+    if (!head) {
+        throw new Error(`${dir}/package.json does not exist. Update published_packages.`);
+    }
+    if (head.packageJson.name !== name) {
+        throw new Error(`${dir}/package.json is named ${head.packageJson.name}, but published_packages says ${name}.`);
+    }
     const base = await deps.readPackage('base', dir);
     if (!base) {
         return { name, status: 'new', version: head?.packageJson.version };
     }
     const changed = await deps.changedFiles(dir);
-    const inHeadScope = head ? resolveShippedScope(head) : () => false;
+    const inHeadScope = resolveShippedScope(head);
     const inBaseScope = resolveShippedScope(base);
     const shippedChanged = changed.filter(file => inHeadScope(file) || inBaseScope(file));
     const baseVersion = base.packageJson.version;
-    const headVersion = head?.packageJson.version;
+    const headVersion = head.packageJson.version;
 
     if (shippedChanged.length === 0) {
         return { name, status: 'unchanged', version: headVersion };
     }
-    if (!head || headVersion !== baseVersion) {
+    if (headVersion !== baseVersion) {
         return { name, status: 'bumped', version: headVersion, baseVersion };
     }
     if (!(await deps.isPublished(name, baseVersion))) {
@@ -81,7 +100,7 @@ const describe = result => {
         case 'unchanged':
             return `${result.name}@${result.version}: no shipped file changed.`;
         case 'bumped':
-            return `${result.name}: bumped ${result.baseVersion} -> ${result.version ?? 'removed'}.`;
+            return `${result.name}: bumped ${result.baseVersion} -> ${result.version}.`;
         case 'unreleased':
             return `${result.name}@${result.version}: not on npm yet, so the next publish carries this change.`;
         default:
@@ -99,6 +118,46 @@ export const parseJsonc = text =>
             .replace(/,(\s*[}\]])/g, '$1')
     );
 
+// Follows relative "extends" and rebases outDir, rootDir, and include onto the package dir.
+export const loadTsconfig = async (packageDir, file, seen = new Set()) => {
+    let config;
+    try {
+        config = parseJsonc(await readFile(file, 'utf8'));
+    } catch (error) {
+        if (error.code === 'ENOENT' && seen.size === 0) {
+            return null;
+        }
+        throw new Error(`${path.relative(packageDir, file) || file}: ${error.message}`);
+    }
+    seen.add(file);
+    const rebase = value => path.relative(packageDir, path.resolve(path.dirname(file), value)) || '.';
+    const own = {
+        compilerOptions: Object.fromEntries(
+            ['outDir', 'rootDir']
+                .filter(key => typeof config.compilerOptions?.[key] === 'string')
+                .map(key => [key, rebase(config.compilerOptions[key])])
+        ),
+        include: Array.isArray(config.include) ? config.include.map(rebase) : undefined,
+    };
+    const parents = [config.extends ?? []]
+        .flat()
+        .filter(entry => entry.startsWith('.'))
+        .map(entry => path.resolve(path.dirname(file), entry.endsWith('.json') ? entry : `${entry}.json`))
+        .filter(parent => !seen.has(parent));
+    let merged = { compilerOptions: {} };
+    for (const parent of parents) {
+        const inherited = await loadTsconfig(packageDir, parent, seen);
+        merged = {
+            compilerOptions: { ...merged.compilerOptions, ...inherited.compilerOptions },
+            include: inherited.include ?? merged.include,
+        };
+    }
+    return {
+        compilerOptions: { ...merged.compilerOptions, ...own.compilerOptions },
+        include: own.include ?? merged.include,
+    };
+};
+
 const readPackageAt = async (root, dir) => {
     const packageDir = path.join(root, dir);
     let packageJson;
@@ -110,14 +169,7 @@ const readPackageAt = async (root, dir) => {
         }
         throw error;
     }
-    let tsconfig = null;
-    try {
-        tsconfig = parseJsonc(await readFile(path.join(packageDir, 'tsconfig.json'), 'utf8'));
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            throw new Error(`${dir}/tsconfig.json: ${error.message}`);
-        }
-    }
+    const tsconfig = await loadTsconfig(packageDir, path.join(packageDir, 'tsconfig.json'));
     const { stdout } = await execFileAsync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
         cwd: packageDir,
         maxBuffer: 64 * 1024 * 1024,
@@ -126,17 +178,53 @@ const readPackageAt = async (root, dir) => {
     return { packageJson, files: packageJson.files ?? [], tsconfig, packFiles };
 };
 
-export const npmIsPublished = async (name, version) => {
+const errorCode = stdout => {
+    try {
+        return JSON.parse(stdout || '{}').error?.code;
+    } catch {
+        return undefined;
+    }
+};
+
+export const npmIsPublished = async (name, version, exec = execFileAsync) => {
     let stdout;
     try {
-        ({ stdout } = await execFileAsync('npm', ['view', `${name}@${version}`, 'version', '--json']));
+        ({ stdout } = await exec('npm', ['view', `${name}@${version}`, 'version', '--json']));
     } catch (error) {
-        if (JSON.parse(error.stdout || '{}').error?.code === 'E404') {
+        if (errorCode(error.stdout) === 'E404') {
             return false;
         }
         throw new Error(`npm view ${name}@${version} failed: ${error.stderr || error.message}`);
     }
     return stdout.trim() !== '';
+};
+
+const commitExists = async (repoRoot, ref) =>
+    git(repoRoot, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).then(
+        () => true,
+        () => false
+    );
+
+// actions/checkout builds a PR's merge ref on the current base tip, which can be newer
+// than pull_request.base.sha, so the merge's first parent is the exact base. A push
+// whose before commit is gone (force-push) falls back to the previous commit.
+const resolveCheckedOutBase = async (repoRoot, env) => {
+    if (!env.BASE_REF && env.PR_BASE_SHA && env.PR_HEAD_SHA) {
+        const parents = (await git(repoRoot, ['rev-list', '--parents', '-n', '1', 'HEAD'])).trim().split(' ');
+        if (parents.length === 3 && parents[2] === env.PR_HEAD_SHA) {
+            return 'HEAD^1';
+        }
+    }
+    const base = resolveBaseRef({
+        baseRef: env.BASE_REF,
+        prBase: env.PR_BASE_SHA,
+        mergeGroupBase: env.MERGE_GROUP_BASE_SHA,
+        pushBefore: env.PUSH_BEFORE_SHA,
+    });
+    if (base === env.PUSH_BEFORE_SHA && !(await commitExists(repoRoot, base))) {
+        return 'HEAD~1';
+    }
+    return base;
 };
 
 export const createGitDeps = async ({ repoRoot, base }) => {
@@ -149,7 +237,7 @@ export const createGitDeps = async ({ repoRoot, base }) => {
         deps: {
             readPackage: (side, dir) => readPackageAt(roots[side], dir),
             changedFiles: async dir => {
-                const prefix = `${dir}/`;
+                const prefix = dir === '.' ? '' : `${dir}/`;
                 const output = await git(repoRoot, ['diff', '--name-only', '--no-renames', '-z', mergeBase, 'HEAD', '--', dir]);
                 return output
                     .split('\0')
@@ -174,12 +262,7 @@ export const main = async (argv = process.argv.slice(2), env = process.env) => {
         throw new Error('published_packages is empty.');
     }
     const repoRoot = path.resolve(values.cwd ?? '.');
-    const base = values.base || resolveBaseRef({
-        baseRef: env.BASE_REF,
-        prBase: env.PR_BASE_SHA,
-        mergeGroupBase: env.MERGE_GROUP_BASE_SHA,
-        pushBefore: env.PUSH_BEFORE_SHA,
-    });
+    const base = values.base || (await resolveCheckedOutBase(repoRoot, env));
     const { mergeBase, deps, cleanup } = await createGitDeps({ repoRoot, base });
     console.log(`Comparing HEAD against merge-base ${mergeBase} (base ${base}).`);
     let results;

@@ -84,9 +84,9 @@ jobs:
 
 `published-package-bump.yml` fails a PR that changes a file a published package ships without bumping that package's version. Run it from Quality so the deploy backstop never has to catch it.
 
-It diffs `HEAD` against its merge-base with the PR base. A push compares against the previous commit, and a merge group against its base. The shipped scope is the `npm pack --dry-run --json --ignore-scripts` file list plus `package.json`, at both the base and the head so deleted files count. CI has not built anything, so when `files` ships the tsconfig `outDir`, the `rootDir` that compiles into it counts as shipped too. Tests, scripts, and fixtures outside that scope never need a bump.
+It diffs `HEAD` against its merge-base with the base. On a pull request the base is the first parent of GitHub's merge ref, which is the base tip the PR was merged onto. A push compares against its `before` commit, or the previous commit when that is gone after a force-push. A merge group compares against its base. The shipped scope is the `npm pack --dry-run --json --ignore-scripts` file list plus `package.json`, at both the base and the head so deleted files count. CI has not built anything, so when `files` ships the tsconfig `outDir`, the source behind it counts as shipped too. That source is `rootDir`, read through relative `extends`. Without `rootDir`, it is the shared root of `include`, else the whole package. Tests, scripts, and fixtures outside that scope never need a bump.
 
-A package passes when no shipped file changed, when its version changed, when it is new in the change, or when the base version is not on npm yet, since the next publish already carries the change. Nothing is installed. The job uses Node built-ins, `git`, and `npm`, with `contents: read` and no secrets, so it is safe on pull requests from forks.
+A package passes when no shipped file changed, when its version changed, when it is new in the change, or when the base version is not on npm yet, since the next publish already carries the change. A dir with no `package.json`, a name that does not match it, or an npm error other than a 404 fails the job. Nothing is installed. The job uses Node built-ins, `git`, and `npm`, with `contents: read` and no secrets, so it is safe on pull requests from forks.
 
 ```yaml
 jobs:

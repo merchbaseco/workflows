@@ -7,6 +7,9 @@ import { after, before, describe, it } from 'node:test';
 import {
     checkPackageBump,
     createGitDeps,
+    loadTsconfig,
+    main,
+    npmIsPublished,
     parseJsonc,
     parsePublishedPackages,
     resolveBaseRef,
@@ -24,8 +27,12 @@ describe('parsePublishedPackages', () => {
         ]);
     });
 
+    it('accepts the repo root, as deploy-service does', () => {
+        assert.deepEqual(parsePublishedPackages('.:@scope/pkg'), [{ dir: '.', name: '@scope/pkg' }]);
+    });
+
     it('rejects entries without a name or with an escaping dir', () => {
-        for (const value of ['packages/cli', ':@scope/cli', '../x:@scope/x', '/abs:@scope/x', '.:@scope/x']) {
+        for (const value of ['packages/cli', ':@scope/cli', '../x:@scope/x', '/abs:@scope/x', 'packages/cli:']) {
             assert.throws(() => parsePublishedPackages(value), /dir:name/, value);
         }
     });
@@ -59,6 +66,21 @@ describe('resolveShippedScope', () => {
         assert.equal(inScope('src/index.ts'), false);
     });
 
+    it('matches a files glob or file under the outDir', () => {
+        for (const files of [['dist/**'], ['./dist/index.js']]) {
+            assert.equal(resolveShippedScope({ packFiles: [], files, tsconfig })('src/index.ts'), true, files[0]);
+        }
+    });
+
+    it('infers rootDir from a shared include root, else the whole package', () => {
+        const scope = include =>
+            resolveShippedScope({ packFiles: [], files: ['dist'], tsconfig: { compilerOptions: { outDir: 'dist' }, include } });
+        assert.equal(scope(['src/**/*'])('src/a.ts'), true);
+        assert.equal(scope(['src/**/*'])('test/a.ts'), false);
+        assert.equal(scope(['src', 'lib'])('test/a.ts'), true);
+        assert.equal(scope(undefined)('test/a.ts'), true);
+    });
+
     it('treats a rootDir of . as the whole package', () => {
         const inScope = resolveShippedScope({
             packFiles: [],
@@ -75,9 +97,47 @@ describe('parseJsonc', () => {
     });
 });
 
+describe('loadTsconfig', () => {
+    it('inherits outDir and rootDir through relative extends, rebased onto the package', async () => {
+        const root = await mkdtemp(path.join(tmpdir(), 'bump-tsconfig-'));
+        await mkdir(path.join(root, 'packages/a'), { recursive: true });
+        await writeFile(path.join(root, 'tsconfig.base.json'), '{ "compilerOptions": { "outDir": "./packages/a/dist", "rootDir": "./packages/a/src" } }');
+        await writeFile(path.join(root, 'packages/a/tsconfig.json'), '{ "extends": "../../tsconfig.base", "include": ["src"] }');
+        const packageDir = path.join(root, 'packages/a');
+        assert.deepEqual(await loadTsconfig(packageDir, path.join(packageDir, 'tsconfig.json')), {
+            compilerOptions: { outDir: 'dist', rootDir: 'src' },
+            include: ['src'],
+        });
+        await rm(root, { recursive: true, force: true });
+    });
+});
+
+describe('npmIsPublished', () => {
+    const exec = result => async () => {
+        if (result instanceof Error) {
+            throw result;
+        }
+        return { stdout: result };
+    };
+    const failure = (stdout, stderr = '') => Object.assign(new Error('npm failed'), { stdout, stderr });
+
+    it('reads a published version as published', async () => {
+        assert.equal(await npmIsPublished('@scope/a', '1.0.0', exec('"1.0.0"\n')), true);
+    });
+
+    it('reads E404 as unpublished', async () => {
+        assert.equal(await npmIsPublished('@scope/a', '1.0.0', exec(failure('{"error":{"code":"E404"}}'))), false);
+    });
+
+    it('fails closed on any other npm error', async () => {
+        await assert.rejects(npmIsPublished('@scope/a', '1.0.0', exec(failure('{"error":{"code":"ETIMEDOUT"}}'))), /npm view/);
+        await assert.rejects(npmIsPublished('@scope/a', '1.0.0', exec(failure('not json', 'boom'))), /boom/);
+    });
+});
+
 describe('checkPackageBump', () => {
     const side = version => ({
-        packageJson: { version },
+        packageJson: { name: '@scope/http-client', version },
         files: ['dist', 'README.md'],
         tsconfig,
         packFiles: ['README.md', 'package.json'],
@@ -122,6 +182,14 @@ describe('checkPackageBump', () => {
 
     it('passes when the package is new in this change', async () => {
         assert.equal((await checkPackageBump(pkg, deps({ base: null }))).status, 'new');
+    });
+
+    it('rejects a dir with no package.json at head', async () => {
+        await assert.rejects(checkPackageBump(pkg, deps({ head: null })), /does not exist/);
+    });
+
+    it('rejects a name that does not match package.json', async () => {
+        await assert.rejects(checkPackageBump({ ...pkg, name: '@scope/typo' }, deps()), /is named @scope\/http-client/);
     });
 });
 
@@ -209,5 +277,64 @@ describe('createGitDeps against a real repository', () => {
             await cleanup();
         }
         assert.equal(run('worktree', 'list').split('\n').length, 1, 'base worktree removed');
+    });
+
+    const runMain = async env => {
+        const lines = [];
+        const log = console.log;
+        const error = console.error;
+        console.log = console.error = line => lines.push(line);
+        try {
+            const code = await main(['--cwd', repo], { PUBLISHED_PACKAGES: 'packages/http-client:@scope/http-client', ...env });
+            return { code, output: lines.join('\n') };
+        } finally {
+            console.log = log;
+            console.error = error;
+        }
+    };
+
+    it('uses the first parent of the PR merge ref, not a stale base sha', async () => {
+        run('checkout', '-q', '-b', 'pr', baseSha);
+        await write('packages/http-client/test/index.test.ts', 'pr\n');
+        run('commit', '-q', '-am', 'pr');
+        const prHead = run('rev-parse', 'HEAD');
+        run('checkout', '-q', '--detach', 'main');
+        run('merge', '-q', '--no-ff', '-m', 'merge ref', prHead);
+        const { code, output } = await runMain({ PR_BASE_SHA: baseSha, PR_HEAD_SHA: prHead });
+        assert.match(output, /base HEAD\^1/);
+        assert.match(output, /no shipped file changed/);
+        assert.equal(code, 0);
+    });
+
+    it('falls back to the previous commit when the push before sha is gone', async () => {
+        const { output } = await runMain({ PUSH_BEFORE_SHA: 'deadbeef'.repeat(5) });
+        assert.match(output, /base HEAD~1/);
+    });
+});
+
+describe('a root package', () => {
+    it('diffs the whole repo and ignores unshipped files', async () => {
+        const repo = await mkdtemp(path.join(tmpdir(), 'bump-root-'));
+        const run = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+        run('init', '-q', '-b', 'main');
+        run('config', 'user.email', 'test@example.com');
+        run('config', 'user.name', 'test');
+        await writeFile(path.join(repo, 'package.json'), JSON.stringify({ name: '@scope/root', version: '1.0.0', files: ['index.js'] }));
+        await writeFile(path.join(repo, 'index.js'), '\n');
+        await writeFile(path.join(repo, 'notes.md'), '\n');
+        run('add', '.');
+        run('commit', '-q', '-m', 'base');
+        const base = run('rev-parse', 'HEAD');
+        await writeFile(path.join(repo, 'notes.md'), 'x\n');
+        await writeFile(path.join(repo, 'index.js'), 'x\n');
+        run('commit', '-q', '-am', 'change');
+        const { deps, cleanup } = await createGitDeps({ repoRoot: repo, base });
+        try {
+            const result = await checkPackageBump({ dir: '.', name: '@scope/root' }, { ...deps, isPublished: async () => true });
+            assert.deepEqual(result.files, ['index.js']);
+        } finally {
+            await cleanup();
+            await rm(repo, { recursive: true, force: true });
+        }
     });
 });
