@@ -79,3 +79,27 @@ jobs:
 | `prepublish_command` | empty | Shell command after install and before the npm token is resolved |
 | `release_token_env_name` | empty | Env name that receives `GH_RELEASE_AGENT_TOOLING_OP_TOKEN`. Required to publish |
 | `release_switch_env_name` | empty | Env name set to `true` before varlock. Required to publish |
+
+## Published package version bump
+
+`published-package-bump.yml` fails a PR that changes a file a published package ships without bumping that package's version. Run it from Quality so the deploy backstop never has to catch it.
+
+It diffs `HEAD` against its merge-base with the PR base. A push compares against the previous commit, and a merge group against its base. The shipped scope is the `npm pack --dry-run --json --ignore-scripts` file list plus `package.json`, at both the base and the head so deleted files count. CI has not built anything, so when `files` ships the tsconfig `outDir`, the `rootDir` that compiles into it counts as shipped too. Tests, scripts, and fixtures outside that scope never need a bump.
+
+A package passes when no shipped file changed, when its version changed, when it is new in the change, or when the base version is not on npm yet, since the next publish already carries the change. Nothing is installed. The job uses Node built-ins, `git`, and `npm`, with `contents: read` and no secrets, so it is safe on pull requests from forks.
+
+```yaml
+jobs:
+  published-package-version-bump:
+    uses: merchbaseco/workflows/.github/workflows/published-package-bump.yml@v1
+    with:
+      published_packages: packages/http-client:@scope/http-client,packages/cli:@scope/cli
+```
+
+| Input | Default | Role |
+| --- | --- | --- |
+| `published_packages` | required | `dir:name,dir:name`, the same value `deploy-service.yml` takes |
+| `base_ref` | empty | Commit to compare against. Empty uses the PR base, the merge group base, or the push's previous commit |
+| `workflows_ref` | empty | `merchbaseco/workflows` commit that supplies the script. Empty uses the ref the caller pinned |
+
+Run it locally from a caller checkout with `node scripts/check-published-package-bump.mjs --packages "<dir:name,...>" --base origin/main`, using the script from this repo.

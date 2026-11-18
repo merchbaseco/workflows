@@ -1,0 +1,6 @@
+{
+    "name": "@merchbaseco/workflows-bump-guard-fixture",
+    "version": "0.0.0",
+    "private": true,
+    "files": ["index.js"]
+}

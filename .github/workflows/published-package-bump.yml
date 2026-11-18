@@ -1,0 +1,68 @@
+name: Published package version bump
+
+on:
+  workflow_call:
+    inputs:
+      published_packages:
+        description: dir:name,dir:name, the same value deploy-service.yml takes.
+        required: true
+        type: string
+      base_ref:
+        description: Commit to compare against. Empty uses the PR base, the merge group base, or the push's previous commit.
+        required: false
+        type: string
+        default: ""
+      workflows_ref:
+        description: merchbaseco/workflows commit that supplies the script. Empty uses the ref this workflow was called at.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Published package version bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the workflows commit
+        id: workflows
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+          WORKFLOWS_REPOSITORY: ${{ job.workflow_repository || 'merchbaseco/workflows' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WORKFLOWS_REF" ]; then
+            echo "Could not resolve the merchbaseco/workflows commit. Set workflows_ref." >&2
+            exit 1
+          fi
+          printf 'ref=%s\nrepository=%s\n' "$WORKFLOWS_REF" "$WORKFLOWS_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "Using ${WORKFLOWS_REPOSITORY}@${WORKFLOWS_REF}."
+
+      - name: Check out the bump script
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.workflows.outputs.repository }}
+          ref: ${{ steps.workflows.outputs.ref }}
+          path: .merchbaseco-workflows
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Fail when a shipped file changed without a version bump
+        env:
+          PUBLISHED_PACKAGES: ${{ inputs.published_packages }}
+          BASE_REF: ${{ inputs.base_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: node .merchbaseco-workflows/scripts/check-published-package-bump.mjs
