@@ -84,22 +84,25 @@ jobs:
 
 `published-package-bump.yml` fails a PR that changes a file a published package ships without bumping that package's version. Run it from Quality so the deploy backstop never has to catch it.
 
-It diffs `HEAD` against its merge-base with the base. On a pull request the base is the first parent of GitHub's merge ref, which is the base tip the PR was merged onto. A push compares against its `before` commit, or the previous commit when that is gone after a force-push. A merge group compares against its base. The shipped scope is the `npm pack --dry-run --json --ignore-scripts` file list plus `package.json`, at both the base and the head so deleted files count. CI has not built anything, so when `files` ships the tsconfig `outDir`, the source behind it counts as shipped too. That source is `rootDir`, read through relative `extends`. Without `rootDir`, it is the shared root of `include`, else the whole package. Tests, scripts, and fixtures outside that scope never need a bump.
+It diffs `HEAD` against its merge-base with the base. On a pull request the base is the first parent of GitHub's merge ref, which is the base tip the PR was merged onto. A push compares against its `before` commit, or the previous commit when that is gone after a force-push. A merge group compares against its base. The shipped scope is the `npm pack --dry-run --json --ignore-scripts` file list plus `package.json`, at both the base and the head so deleted files count. CI has not built anything, so a `files` entry with nothing behind it in the pack list is unbuilt output, and the source behind it counts as shipped. With `source_dirs`, that source is the listed dirs. When the tsconfig `outDir` covers the entry, it is `rootDir`, read through relative `extends`, or else the shared root of `include`. Otherwise, as with `bun build` and no tsconfig, it is the whole package. Test files (`*.test.*`, `*.spec.*`, `test/`, `tests/`, `__tests__/`, `__mocks__/`) and fixtures never count toward that source scope.
 
 A package passes when no shipped file changed, when its version changed, when it is new in the change, or when the base version is not on npm yet, since the next publish already carries the change. A dir with no `package.json`, a name that does not match it, or an npm error other than a 404 fails the job. Nothing is installed. The job uses Node built-ins, `git`, and `npm`, with `contents: read` and no secrets, so it is safe on pull requests from forks.
 
 ```yaml
 jobs:
   published-package-version-bump:
-    uses: merchbaseco/workflows/.github/workflows/published-package-bump.yml@v1
+    uses: merchbaseco/workflows/.github/workflows/published-package-bump.yml@main
     with:
       published_packages: packages/http-client:@scope/http-client,packages/cli:@scope/cli
+      # Optional. Narrows a bun-built package from "everything but tests" to its source.
+      source_dirs: packages/cli:src
 ```
 
 | Input | Default | Role |
 | --- | --- | --- |
 | `published_packages` | required | `dir:name,dir:name`, the same value `deploy-service.yml` takes |
+| `source_dirs` | empty | `dir:path,dir:path` naming the source behind each package's unbuilt output, relative to the package. Empty infers it as above |
 | `base_ref` | empty | Commit to compare against. Empty uses the PR base, the merge group base, or the push's previous commit |
 | `workflows_ref` | empty | `merchbaseco/workflows` commit that supplies the script. Empty uses the ref the caller pinned |
 
-Run it locally from a caller checkout with `node scripts/check-published-package-bump.mjs --packages "<dir:name,...>" --base origin/main`, using the script from this repo.
+Run it locally from a caller checkout with `node scripts/check-published-package-bump.mjs --packages "<dir:name,...>" [--source-dirs "<dir:path,...>"] --base origin/main`, using the script from this repo.

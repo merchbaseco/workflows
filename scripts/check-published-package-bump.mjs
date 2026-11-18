@@ -10,7 +10,7 @@ import { parseArgs, promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const ZERO_SHA = /^0+$/;
 
-export const parsePublishedPackages = value =>
+const parseDirEntries = (value, label, valueName) =>
     value
         .split(',')
         .map(entry => entry.trim())
@@ -19,12 +19,28 @@ export const parsePublishedPackages = value =>
             const separator = entry.indexOf(':');
             const rawDir = separator === -1 ? '' : entry.slice(0, separator);
             const dir = rawDir && path.posix.normalize(rawDir).replace(/\/$/, '');
-            const name = separator === -1 ? '' : entry.slice(separator + 1);
-            if (!dir || !name || path.posix.isAbsolute(dir) || dir.split('/').includes('..')) {
-                throw new Error(`published_packages entries must be dir:name with a relative dir, got ${entry}.`);
+            const rest = separator === -1 ? '' : entry.slice(separator + 1);
+            if (!dir || !rest || path.posix.isAbsolute(dir) || dir.split('/').includes('..')) {
+                throw new Error(`${label} entries must be dir:${valueName} with a relative dir, got ${entry}.`);
             }
-            return { dir, name };
+            return { dir, rest };
         });
+
+export const parsePublishedPackages = value =>
+    parseDirEntries(value, 'published_packages', 'name').map(({ dir, rest }) => ({ dir, name: rest }));
+
+// "dir:src,dir:bin" names the source behind a package's unbuilt output, relative to dir.
+export const parseSourceDirs = value => {
+    const byDir = new Map();
+    for (const { dir, rest } of parseDirEntries(value, 'source_dirs', 'path')) {
+        const sourceDir = stripDotSlash(rest);
+        if (path.posix.isAbsolute(sourceDir) || sourceDir.split('/').includes('..')) {
+            throw new Error(`source_dirs paths must stay inside the package, got ${dir}:${rest}.`);
+        }
+        byDir.set(dir, [...(byDir.get(dir) ?? []), sourceDir]);
+    }
+    return byDir;
+};
 
 export const resolveBaseRef = ({ baseRef, prBase, mergeGroupBase, pushBefore }) => {
     for (const candidate of [baseRef, prBase, mergeGroupBase, pushBefore]) {
@@ -45,24 +61,68 @@ const inferRootDir = include => {
     return roots.size === 1 && root && !root.includes('*') ? root : '.';
 };
 
-// npm pack only lists build output that exists, and CI has not built it. When "files"
-// ships the tsconfig outDir, the rootDir that compiles into it is shipped source.
-export const resolveShippedScope = ({ packFiles, files = [], tsconfig }) => {
-    const exact = new Set(['package.json', ...packFiles]);
-    const prefixes = [];
-    const outDir = stripDotSlash(tsconfig?.compilerOptions?.outDir ?? '');
-    const shipsOutDir = files.some(entry => {
-        const shipped = stripDotSlash(entry);
-        return shipped === outDir || shipped.startsWith(`${outDir}/`) || /[*?[{!]/.test(shipped.split('/')[0]);
-    });
-    if (outDir && outDir !== '.' && shipsOutDir) {
-        const rootDir = stripDotSlash(tsconfig.compilerOptions.rootDir ?? inferRootDir(tsconfig.include));
-        prefixes.push(rootDir === '.' ? '' : `${rootDir}/`);
+const GLOB_CHARS = /[*?[\]{}!]/;
+const NOT_SHIPPED = /(^|\/)(test|tests|__tests__|__mocks__|fixtures|__fixtures__)\/|\.(test|spec)\.[^/]+$/;
+
+// "**" spans directories, "*" and "?" stay inside one. Brackets, braces, and
+// negation return null so callers can take the conservative branch.
+const globToRegExp = glob => {
+    if (/[[\]{}!]/.test(glob)) {
+        return null;
     }
-    return file => exact.has(file) || prefixes.some(prefix => file.startsWith(prefix));
+    const tokens = { '**/': '(?:.*/)?', '**': '.*', '*': '[^/]*', '?': '[^/]' };
+    const source = glob
+        .split(/(\*\*\/?|\*|\?)/)
+        .map(part => tokens[part] ?? part.replace(/[.+^$()|\\]/g, '\\$&'))
+        .join('');
+    return new RegExp(`^${source}(?:/.*)?$`);
 };
 
-export const checkPackageBump = async ({ dir, name }, deps) => {
+// An entry with nothing behind it in the pack list is build output CI has not built.
+const isUnbuilt = (entry, packFiles) => {
+    if (!GLOB_CHARS.test(entry)) {
+        return !packFiles.some(file => file === entry || file.startsWith(`${entry}/`));
+    }
+    const pattern = globToRegExp(entry);
+    return !pattern || !packFiles.some(file => pattern.test(file));
+};
+
+const coversOutDir = (entry, outDir) => {
+    if (!outDir || outDir === '.') {
+        return false;
+    }
+    if (!GLOB_CHARS.test(entry)) {
+        return entry === outDir || entry.startsWith(`${outDir}/`) || outDir.startsWith(`${entry}/`);
+    }
+    const pattern = globToRegExp(entry);
+    return !pattern || pattern.test(`${outDir}/index.js`) || pattern.test(`${outDir}/index.d.ts`);
+};
+
+const prefixFor = dir => (dir === '.' ? '' : `${dir}/`);
+
+// npm pack only lists build output that exists, and CI has not built it. Each unbuilt
+// "files" entry maps to the source behind it: sourceDirs when the caller names them,
+// the tsconfig rootDir when its outDir covers the entry, else the whole package
+// minus tests and fixtures, so an unknown build fails closed.
+export const resolveShippedScope = ({ packFiles, files = [], tsconfig, sourceDirs = [] }) => {
+    const exact = new Set(['package.json', ...packFiles]);
+    const prefixes = new Set();
+    const outDir = stripDotSlash(tsconfig?.compilerOptions?.outDir ?? '');
+    for (const entry of files.map(stripDotSlash).filter(entry => isUnbuilt(entry, packFiles))) {
+        if (sourceDirs.length > 0) {
+            sourceDirs.forEach(sourceDir => prefixes.add(prefixFor(sourceDir)));
+        } else if (coversOutDir(entry, outDir)) {
+            prefixes.add(prefixFor(stripDotSlash(tsconfig.compilerOptions.rootDir ?? inferRootDir(tsconfig.include))));
+        } else {
+            prefixes.add('');
+        }
+    }
+    return file =>
+        exact.has(file) ||
+        [...prefixes].some(prefix => file.startsWith(prefix) && !NOT_SHIPPED.test(file.slice(prefix.length)));
+};
+
+export const checkPackageBump = async ({ dir, name, sourceDirs = [] }, deps) => {
     const head = await deps.readPackage('head', dir);
     if (!head) {
         throw new Error(`${dir}/package.json does not exist. Update published_packages.`);
@@ -75,8 +135,8 @@ export const checkPackageBump = async ({ dir, name }, deps) => {
         return { name, status: 'new', version: head?.packageJson.version };
     }
     const changed = await deps.changedFiles(dir);
-    const inHeadScope = resolveShippedScope(head);
-    const inBaseScope = resolveShippedScope(base);
+    const inHeadScope = resolveShippedScope({ ...head, sourceDirs });
+    const inBaseScope = resolveShippedScope({ ...base, sourceDirs });
     const shippedChanged = changed.filter(file => inHeadScope(file) || inBaseScope(file));
     const baseVersion = base.packageJson.version;
     const headVersion = head.packageJson.version;
@@ -230,7 +290,10 @@ const resolveCheckedOutBase = async (repoRoot, env) => {
 export const createGitDeps = async ({ repoRoot, base }) => {
     const mergeBase = (await git(repoRoot, ['merge-base', base, 'HEAD'])).trim();
     const baseRoot = await mkdtemp(path.join(tmpdir(), 'bump-base-'));
-    await git(repoRoot, ['worktree', 'add', '--detach', baseRoot, mergeBase]);
+    await git(repoRoot, ['worktree', 'add', '--detach', baseRoot, mergeBase]).catch(async error => {
+        await rm(baseRoot, { recursive: true, force: true });
+        throw error;
+    });
     const roots = { head: repoRoot, base: baseRoot };
     return {
         mergeBase,
@@ -255,9 +318,22 @@ export const createGitDeps = async ({ repoRoot, base }) => {
 export const main = async (argv = process.argv.slice(2), env = process.env) => {
     const { values } = parseArgs({
         args: argv,
-        options: { packages: { type: 'string' }, base: { type: 'string' }, cwd: { type: 'string' } },
+        options: {
+            packages: { type: 'string' },
+            'source-dirs': { type: 'string' },
+            base: { type: 'string' },
+            cwd: { type: 'string' },
+        },
     });
-    const packages = parsePublishedPackages(values.packages ?? env.PUBLISHED_PACKAGES ?? '');
+    const sourceDirs = parseSourceDirs(values['source-dirs'] ?? env.SOURCE_DIRS ?? '');
+    const packages = parsePublishedPackages(values.packages ?? env.PUBLISHED_PACKAGES ?? '').map(pkg => ({
+        ...pkg,
+        sourceDirs: sourceDirs.get(pkg.dir) ?? [],
+    }));
+    const unknown = [...sourceDirs.keys()].filter(dir => !packages.some(pkg => pkg.dir === dir));
+    if (unknown.length > 0) {
+        throw new Error(`source_dirs names dirs that are not in published_packages: ${unknown.join(', ')}.`);
+    }
     if (packages.length === 0) {
         throw new Error('published_packages is empty.');
     }

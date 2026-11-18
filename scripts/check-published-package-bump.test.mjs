@@ -7,6 +7,7 @@ import { after, before, describe, it } from 'node:test';
 import {
     checkPackageBump,
     createGitDeps,
+    parseSourceDirs,
     loadTsconfig,
     main,
     npmIsPublished,
@@ -35,6 +36,19 @@ describe('parsePublishedPackages', () => {
         for (const value of ['packages/cli', ':@scope/cli', '../x:@scope/x', '/abs:@scope/x', 'packages/cli:']) {
             assert.throws(() => parsePublishedPackages(value), /dir:name/, value);
         }
+    });
+});
+
+describe('parseSourceDirs', () => {
+    it('groups source dirs by package dir', () => {
+        assert.deepEqual(parseSourceDirs('packages/cli:src, packages/cli:./bin/,packages/http-client:lib'), new Map([
+            ['packages/cli', ['src', 'bin']],
+            ['packages/http-client', ['lib']],
+        ]));
+    });
+
+    it('rejects a source dir that leaves the package', () => {
+        assert.throws(() => parseSourceDirs('packages/cli:../other'), /inside the package/);
     });
 });
 
@@ -77,8 +91,49 @@ describe('resolveShippedScope', () => {
             resolveShippedScope({ packFiles: [], files: ['dist'], tsconfig: { compilerOptions: { outDir: 'dist' }, include } });
         assert.equal(scope(['src/**/*'])('src/a.ts'), true);
         assert.equal(scope(['src/**/*'])('test/a.ts'), false);
-        assert.equal(scope(['src', 'lib'])('test/a.ts'), true);
-        assert.equal(scope(undefined)('test/a.ts'), true);
+        assert.equal(scope(['src', 'lib'])('lib/a.ts'), true);
+        assert.equal(scope(undefined)('other/a.ts'), true);
+    });
+
+    it('covers a nested outDir with a parent files entry', () => {
+        const nested = { compilerOptions: { outDir: 'dist/esm', rootDir: 'src' } };
+        for (const files of [['dist'], ['dist/**']]) {
+            const inScope = resolveShippedScope({ packFiles: [], files, tsconfig: nested });
+            assert.deepEqual(['src/a.ts', 'scripts/build.ts'].filter(inScope), ['src/a.ts'], files[0]);
+        }
+    });
+
+    it('fails closed on unbuilt output with no tsconfig, as with bun build', () => {
+        const inScope = resolveShippedScope({ packFiles: ['package.json'], files: ['dist'], tsconfig: null });
+        assert.deepEqual(
+            [
+                'src/index.ts',
+                'scripts/build.ts',
+                'bunfig.toml',
+                'test/index.test.ts',
+                'src/__tests__/a.ts',
+                'src/index.test.ts',
+                'src/a.spec.ts',
+                'fixtures/a.json',
+                'test/fixtures/b.json',
+            ].filter(inScope),
+            ['src/index.ts', 'scripts/build.ts', 'bunfig.toml']
+        );
+    });
+
+    it('fails closed when the outDir does not cover the unbuilt entry', () => {
+        const inScope = resolveShippedScope({ packFiles: [], files: ['bin'], tsconfig });
+        assert.deepEqual(['src/a.ts', 'cli/main.ts'].filter(inScope), ['src/a.ts', 'cli/main.ts']);
+    });
+
+    it('uses source_dirs instead of the fallback', () => {
+        const inScope = resolveShippedScope({ packFiles: [], files: ['dist'], tsconfig: null, sourceDirs: ['src'] });
+        assert.deepEqual(['src/index.ts', 'scripts/build.ts'].filter(inScope), ['src/index.ts']);
+    });
+
+    it('leaves built and literal entries to the pack list', () => {
+        const inScope = resolveShippedScope({ packFiles: ['README.md', 'bin/cli.js'], files: ['README.md', 'bin', '*.md'], tsconfig: null });
+        assert.deepEqual(['README.md', 'bin/cli.js', 'src/a.ts'].filter(inScope), ['README.md', 'bin/cli.js']);
     });
 
     it('treats a rootDir of . as the whole package', () => {
@@ -309,6 +364,56 @@ describe('createGitDeps against a real repository', () => {
     it('falls back to the previous commit when the push before sha is gone', async () => {
         const { output } = await runMain({ PUSH_BEFORE_SHA: 'deadbeef'.repeat(5) });
         assert.match(output, /base HEAD~1/);
+    });
+});
+
+describe('a bun build package with no tsconfig', () => {
+    it('flags a src edit and ignores a test edit', async () => {
+        const repo = await mkdtemp(path.join(tmpdir(), 'bump-bun-'));
+        const run = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+        const write = async (file, content) => {
+            await mkdir(path.dirname(path.join(repo, file)), { recursive: true });
+            await writeFile(path.join(repo, file), content);
+        };
+        run('init', '-q', '-b', 'main');
+        run('config', 'user.email', 'test@example.com');
+        run('config', 'user.name', 'test');
+        await write('.gitignore', 'dist/\n');
+        await write(
+            'packages/cli/package.json',
+            JSON.stringify({
+                name: '@scope/cli',
+                version: '1.0.0',
+                bin: { cli: './dist/cli.js' },
+                files: ['dist'],
+                scripts: { build: 'bun build src/cli.ts --outfile dist/cli.js' },
+            })
+        );
+        await write('packages/cli/src/cli.ts', '\n');
+        await write('packages/cli/test/cli.test.ts', '\n');
+        run('add', '.');
+        run('commit', '-q', '-m', 'base');
+        const base = run('rev-parse', 'HEAD');
+        await write('packages/cli/test/cli.test.ts', 'x\n');
+        run('commit', '-q', '-am', 'test only');
+        const testOnly = run('rev-parse', 'HEAD');
+        await write('packages/cli/src/cli.ts', 'x\n');
+        run('commit', '-q', '-am', 'src');
+        const check = async from => {
+            const { deps, cleanup } = await createGitDeps({ repoRoot: repo, base: from });
+            try {
+                return await checkPackageBump({ dir: 'packages/cli', name: '@scope/cli' }, { ...deps, isPublished: async () => true });
+            } finally {
+                await cleanup();
+            }
+        };
+        try {
+            assert.deepEqual((await check(testOnly)).files, ['src/cli.ts']);
+            run('checkout', '-q', testOnly);
+            assert.equal((await check(base)).status, 'unchanged');
+        } finally {
+            await rm(repo, { recursive: true, force: true });
+        }
     });
 });
 

@@ -7,6 +7,11 @@ on:
         description: dir:name,dir:name, the same value deploy-service.yml takes.
         required: true
         type: string
+      source_dirs:
+        description: dir:path,dir:path naming the source behind each package's unbuilt output. Empty infers it from tsconfig, else the whole package minus tests and fixtures.
+        required: false
+        type: string
+        default: ""
       base_ref:
         description: Commit to compare against. Empty uses the PR base, the merge group base, or the push's previous commit.
         required: false
@@ -61,6 +66,7 @@ jobs:
       - name: Fail when a shipped file changed without a version bump
         env:
           PUBLISHED_PACKAGES: ${{ inputs.published_packages }}
+          SOURCE_DIRS: ${{ inputs.source_dirs }}
           BASE_REF: ${{ inputs.base_ref }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
