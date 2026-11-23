@@ -91,8 +91,28 @@ permissions:
   packages: read
 
 jobs:
+  trigger-guard:
+    name: Refuse untrusted triggers
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require a manual run or a Quality run from a push to this repo
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then exit 0; fi
+          if [ "$EVENT_NAME" = workflow_run ] && [ "$RUN_EVENT" = push ] && [ "$RUN_REPO" = "$REPO" ]; then exit 0; fi
+          echo "Refusing to deploy: trigger is event=$EVENT_NAME workflow_run.event=${RUN_EVENT:-none} head_repository=${RUN_REPO:-none}; only workflow_dispatch or a workflow_run from a push to $REPO may deploy." >&2
+          exit 1
+
   deploy:
     name: Deploy
+    needs: trigger-guard
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     permissions:
